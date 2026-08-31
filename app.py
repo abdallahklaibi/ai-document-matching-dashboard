@@ -188,18 +188,16 @@ def preprocess_image(image):
 
 
 def ocr_top_form(image):
-    """OCR only the top information block; this avoids table/date noise lower on the page."""
+    """Fast OCR: read only the upper customer-information section of the form."""
     w, h = image.size
-    # Customer fields occupy roughly upper 36% of the scanned form.
-    crop = image.crop((int(w * 0.08), int(h * 0.07), int(w * 0.82), int(h * 0.38)))
+    # The useful customer fields are in the upper part of this form.
+    crop = image.crop((int(w * 0.07), int(h * 0.06), int(w * 0.84), int(h * 0.34)))
     crop = preprocess_image(crop)
-    # Two OCR passes are combined: psm 6 for lines, psm 11 for sparse handwriting.
-    t1 = pytesseract.image_to_string(crop, config="--psm 6")
-    t2 = pytesseract.image_to_string(crop, config="--psm 11")
-    return (t1 + "\n" + t2).strip()
+    # One sparse-text pass is much faster than OCR-ing the entire page twice.
+    return pytesseract.image_to_string(crop, config="--psm 11").strip()
 
 
-def render_page(page, dpi=240):
+def render_page(page, dpi=175):
     matrix = fitz.Matrix(dpi / 72.0, dpi / 72.0)
     pix = page.get_pixmap(matrix=matrix, alpha=False)
     return Image.open(io.BytesIO(pix.tobytes("png")))
@@ -248,41 +246,126 @@ def best_name_matches(ocr_text, name_rows, limit=3):
 # -------------------- Evidence fusion --------------------
 
 def evaluate_page(ocr_text, page_no, df, name_col, account_col, phone_col, account_map, phone_map, name_rows):
-    accounts = extract_account_candidates(ocr_text)
+    """
+    Smart fallback order requested by the user:
+    1) Phone first.
+    2) If phone is unclear / not found in Excel, try Name.
+    3) If name is unclear / ambiguous, try Account Number.
+
+    Agreement from a second field upgrades confidence when available.
+    """
     phones = extract_uae_phones(ocr_text)
+    accounts = extract_account_candidates(ocr_text)
     name_candidates = best_name_matches(ocr_text, name_rows, limit=5)
 
-    scores = {}
-    evidence = {}
+    chosen_idx = None
+    method = ""
+    confidence = "Not Matched"
+    score = 0
+    evidence = []
+    matched = False
 
-    def add(idx, points, why):
-        scores[idx] = scores.get(idx, 0) + points
-        evidence.setdefault(idx, []).append(why)
-
-    # Account number is the strongest, most discriminating key.
-    for acc in accounts:
-        for idx in account_map.get(acc, []):
-            add(idx, 65, f"Account {acc}")
-
-    # Phone is also very strong.
+    # ---------- 1. PHONE FIRST ----------
+    phone_hits = []
     for ph in phones:
         for idx in phone_map.get(ph, []):
-            add(idx, 60, f"Phone {ph}")
+            phone_hits.append((idx, ph))
 
-    # Name supports/recovers cases where number OCR fails.
-    for sim, idx, raw_name in name_candidates:
-        if sim >= 0.88:
-            add(idx, 45, f"Name {sim:.0%}")
-        elif sim >= 0.76:
-            add(idx, 32, f"Name {sim:.0%}")
-        elif sim >= 0.64:
-            add(idx, 20, f"Name {sim:.0%}")
-        elif sim >= 0.54:
-            add(idx, 10, f"Name {sim:.0%}")
+    unique_phone_rows = sorted(set(idx for idx, _ in phone_hits))
+    if len(unique_phone_rows) == 1:
+        chosen_idx = unique_phone_rows[0]
+        matched_phone = next(ph for idx, ph in phone_hits if idx == chosen_idx)
+        method = "Phone"
+        evidence.append(f"Phone {matched_phone}")
+        score = 92
+        confidence = "High"
+        matched = True
 
-    if not scores:
+        # Optional supporting evidence can only strengthen the result.
+        row_account = normalize_account(df.loc[chosen_idx, account_col]) if account_col else ""
+        if row_account and row_account in accounts:
+            evidence.append(f"Account {row_account}")
+            score = 100
+        for sim, idx, raw_name in name_candidates:
+            if idx == chosen_idx and sim >= 0.72:
+                evidence.append(f"Name {sim:.0%}")
+                score = min(100, score + 5)
+                break
+
+    # ---------- 2. NAME FALLBACK ----------
+    if chosen_idx is None and name_candidates:
+        best_sim, best_idx, raw_name = name_candidates[0]
+        second_sim = name_candidates[1][0] if len(name_candidates) > 1 else 0.0
+        margin = best_sim - second_sim
+
+        # A clear fuzzy-name winner is enough to proceed.
+        if best_sim >= 0.80 and margin >= 0.08:
+            chosen_idx = best_idx
+            method = "Name"
+            evidence.append(f"Name {best_sim:.0%}")
+            score = int(min(90, 60 + best_sim * 30))
+            confidence = "Medium"
+            matched = True
+
+            # Exact account/phone agreement upgrades to High.
+            row_account = normalize_account(df.loc[chosen_idx, account_col]) if account_col else ""
+            row_phones = extract_uae_phones(df.loc[chosen_idx, phone_col]) if phone_col else []
+            if row_account and row_account in accounts:
+                evidence.append(f"Account {row_account}")
+                score = min(100, score + 15)
+                confidence = "High"
+            if set(row_phones) & set(phones):
+                common = list(set(row_phones) & set(phones))[0]
+                evidence.append(f"Phone {common}")
+                score = 100
+                confidence = "High"
+        elif best_sim >= 0.65 and margin >= 0.05:
+            # Keep a plausible but weak name for manual review; account fallback may still rescue it below.
+            chosen_idx = best_idx
+            method = "Name"
+            evidence.append(f"Name {best_sim:.0%}")
+            score = int(45 + best_sim * 20)
+            confidence = "Manual Review"
+            matched = False
+
+    # ---------- 3. ACCOUNT FALLBACK ----------
+    # Use account number when no automatic phone/name match was achieved.
+    if not matched:
+        account_hits = []
+        for acc in accounts:
+            for idx in account_map.get(acc, []):
+                account_hits.append((idx, acc))
+        unique_account_rows = sorted(set(idx for idx, _ in account_hits))
+
+        if len(unique_account_rows) == 1:
+            acc_idx = unique_account_rows[0]
+            matched_acc = next(acc for idx, acc in account_hits if idx == acc_idx)
+            chosen_idx = acc_idx
+            method = "Account Number"
+            evidence = [f"Account {matched_acc}"]
+            score = 88
+            confidence = "High"
+            matched = True
+
+            # Supporting name evidence upgrades/validates.
+            for sim, idx, raw_name in name_candidates:
+                if idx == chosen_idx and sim >= 0.65:
+                    evidence.append(f"Name {sim:.0%}")
+                    score = min(100, score + 8)
+                    break
+        elif len(unique_account_rows) > 1 and chosen_idx is None:
+            # Account exists but is not unique; do not auto-match it.
+            chosen_idx = unique_account_rows[0]
+            method = "Account Number"
+            evidence = ["Account number is not unique in Excel"]
+            score = 45
+            confidence = "Manual Review"
+            matched = False
+
+    if chosen_idx is None:
         return {
             "Page": page_no,
+            "Match Method": "No clear field",
             "OCR Name/Text": " ".join(normalize_latin_name(ocr_text).split()[:18]),
             "PDF Account": accounts[0] if accounts else "",
             "PDF Phone": phones[0] if phones else "",
@@ -293,54 +376,27 @@ def evaluate_page(ocr_text, page_no, df, name_col, account_col, phone_col, accou
             "Excel Name": "",
             "Excel Account": "",
             "Excel Phone": "",
-            "Evidence": "No reliable evidence",
+            "Evidence": "Phone unclear → Name unclear → Account unclear",
         }
 
-    ranked = sorted(scores.items(), key=lambda kv: kv[1], reverse=True)
-    best_idx, raw_score = ranked[0]
-    second_score = ranked[1][1] if len(ranked) > 1 else 0
-    margin = raw_score - second_score
-    score = min(raw_score, 100)
-
-    # Require evidence quality, not just a weak fuzzy name.
-    ev = evidence.get(best_idx, [])
-    has_account = any(x.startswith("Account") for x in ev)
-    has_phone = any(x.startswith("Phone") for x in ev)
-    has_name = any(x.startswith("Name") for x in ev)
-
-    if (has_account or has_phone) and (has_name or raw_score >= 60) and margin >= 15:
-        confidence = "High"
-        matched = True
-    elif (has_account or has_phone) and margin >= 8:
-        confidence = "Medium"
-        matched = True
-    elif has_name and raw_score >= 32 and margin >= 10:
-        confidence = "Medium"
-        matched = True
-    elif raw_score >= 20:
-        confidence = "Manual Review"
-        matched = False
-    else:
-        confidence = "Not Matched"
-        matched = False
-
-    excel_name = clean_text(df.loc[best_idx, name_col]) if name_col else ""
-    excel_account = clean_text(df.loc[best_idx, account_col]) if account_col else ""
-    excel_phone = clean_text(df.loc[best_idx, phone_col]) if phone_col else ""
+    excel_name = clean_text(df.loc[chosen_idx, name_col]) if name_col else ""
+    excel_account = clean_text(df.loc[chosen_idx, account_col]) if account_col else ""
+    excel_phone = clean_text(df.loc[chosen_idx, phone_col]) if phone_col else ""
 
     return {
         "Page": page_no,
+        "Match Method": method,
         "OCR Name/Text": " ".join(normalize_latin_name(ocr_text).split()[:18]),
         "PDF Account": accounts[0] if accounts else "",
         "PDF Phone": phones[0] if phones else "",
         "Matched": matched,
         "Confidence": confidence,
         "Match Score": int(score),
-        "Excel Row": int(best_idx) + 2,
+        "Excel Row": int(chosen_idx) + 2,
         "Excel Name": excel_name,
         "Excel Account": excel_account,
         "Excel Phone": excel_phone,
-        "Evidence": ", ".join(ev),
+        "Evidence": ", ".join(evidence),
     }
 
 
@@ -425,7 +481,7 @@ def create_output_excel(original_df, results_df):
 st.markdown("""
 <div class="hero">
   <h1>Customer Record Matching & Reconciliation</h1>
-  <p>Free PDF-to-Excel matching using Name + Account Number + Phone, with local OCR and no paid AI service.</p>
+  <p>Free PDF-to-Excel matching with smart fallback: Phone → Name → Account Number, using local OCR and no paid AI service.</p>
 </div>
 """, unsafe_allow_html=True)
 
@@ -433,7 +489,7 @@ steps = st.columns(4)
 for c, title, desc in zip(
     steps,
     ["1 · Upload", "2 · Read", "3 · Match", "4 · Export"],
-    ["Scanned PDF + Excel", "Free local OCR", "Name + Account + Phone", "Highlighted Excel"],
+    ["Scanned PDF + Excel", "Fast top-section OCR", "Phone → Name → Account", "Highlighted Excel"],
 ):
     c.markdown(f'<div class="step"><b>{title}</b><br><span class="small-muted">{desc}</span></div>', unsafe_allow_html=True)
 
@@ -472,6 +528,13 @@ if df is not None and len(df.columns):
 
 st.caption("No Claude, no API key and no paid AI service. OCR runs with open-source Tesseract on the Streamlit server.")
 
+run_mode = st.radio(
+    "Run mode",
+    ["Quick Test — first 10 pages", "Full Monthly Run — all pages"],
+    horizontal=True,
+    help="Use Quick Test first to verify matching before processing the full PDF.",
+)
+
 run = st.button(
     "Run Monthly Analysis",
     type="primary",
@@ -488,12 +551,13 @@ if run:
             account_map, phone_map, name_rows = build_indexes(df, name_col, account_col, phone_col)
             pdf_bytes = pdf_file.getvalue()
             doc = fitz.open(stream=pdf_bytes, filetype="pdf")
-            total_pages = len(doc)
+            pdf_total_pages = len(doc)
+            total_pages = min(10, pdf_total_pages) if run_mode.startswith("Quick Test") else pdf_total_pages
             results = []
 
             for page_index in range(total_pages):
                 page = doc.load_page(page_index)
-                image = render_page(page, dpi=240)
+                image = render_page(page, dpi=175)
                 ocr_text = ocr_top_form(image)
                 result = evaluate_page(
                     ocr_text, page_index + 1, df,
@@ -568,9 +632,10 @@ if "multi_results" in st.session_state:
 
     with st.expander("How matching works"):
         st.markdown("""
-- **Account number** is the strongest evidence when OCR reads it correctly.
-- **Phone number** is another strong exact-match signal.
-- **Name** uses fuzzy matching so small OCR spelling errors can still match.
+- The app follows the requested fallback order: **Phone → Name → Account Number**.
+- A clear **phone** match is accepted first. If the phone is unclear or does not match Excel, the app tries the **name**.
+- If the name is also unclear or ambiguous, it tries the **account number**.
+- A second agreeing field can upgrade the confidence.
 - **High** means strong evidence with a clear winner.
 - **Medium** means a likely match that should still be spot-checked.
 - **Manual Review** means the page has some evidence, but not enough for automatic acceptance.
