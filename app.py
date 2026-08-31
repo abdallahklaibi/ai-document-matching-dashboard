@@ -37,15 +37,59 @@ div[data-testid="stMetric"] {border: 1px solid rgba(120,120,120,.20); padding: 1
 """, unsafe_allow_html=True)
 
 
+def _digits(value):
+    if value is None:
+        return ""
+    try:
+        if pd.isna(value):
+            return ""
+    except Exception:
+        pass
+    return re.sub(r"\D", "", str(value))
+
+
+MOBILE_PREFIXES = {"050", "052", "054", "055", "056", "058"}
+LANDLINE_PREFIXES = {"02", "03", "04", "06", "07", "09"}
+
+
 def normalize_phone(value):
-    if value is None or pd.isna(value):
+    """Return a consistent UAE local-format phone number, or an empty string.
+
+    Examples:
+      +971 50 123 4567 -> 0501234567
+      00971 3 765 4321 -> 037654321
+      50 123 4567      -> 0501234567  (missing leading zero recovered)
+    """
+    d = _digits(value)
+    if not d:
         return ""
-    s = re.sub(r"\D", "", str(value))
-    if not s:
+
+    if d.startswith("00971"):
+        d = d[2:]  # -> 971...
+
+    if d.startswith("971"):
+        national = d[3:]
+        if len(national) == 9 and ("0" + national[:2]) in MOBILE_PREFIXES:
+            return "0" + national
+        if len(national) == 8 and ("0" + national[:1]) in LANDLINE_PREFIXES:
+            return "0" + national
         return ""
-    if s.startswith("00"):
-        s = s[2:]
-    return s
+
+    # Standard UAE local mobile: 05X + 7 digits.
+    if len(d) == 10 and d[:3] in MOBILE_PREFIXES:
+        return d
+
+    # Standard UAE local landline: 0X + 7 digits.
+    if len(d) == 9 and d[:2] in LANDLINE_PREFIXES:
+        return d
+
+    # OCR / source data sometimes drops the first zero.
+    if len(d) == 9 and ("0" + d[:2]) in MOBILE_PREFIXES:
+        return "0" + d
+    if len(d) == 8 and ("0" + d[:1]) in LANDLINE_PREFIXES:
+        return "0" + d
+
+    return ""
 
 
 def phone_variants(phone):
@@ -53,13 +97,56 @@ def phone_variants(phone):
     if not p:
         return set()
     variants = {p}
-    if len(p) >= 7:
-        variants.add(p[-7:])
-    if len(p) >= 8:
-        variants.add(p[-8:])
-    if len(p) >= 9:
-        variants.add(p[-9:])
+    if p.startswith("0"):
+        variants.add("971" + p[1:])
+        variants.add(p[1:])
     return variants
+
+
+def extract_phone_candidates(text):
+    """Extract UAE phone-shaped values only, avoiding IDs/dates/random long numbers."""
+    text = str(text or "")
+    patterns = [
+        # UAE mobile in international form: +971 50 123 4567 / 00971 50 123 4567
+        r"(?<!\d)(?:\+?971|00971)[\s().-]*5[024568](?:[\s().-]*\d){7}(?!\d)",
+        # UAE mobile local form: 050 123 4567 (or OCR-dropped leading zero: 50 123 4567)
+        r"(?<!\d)0?5[024568](?:[\s().-]*\d){7}(?!\d)",
+        # UAE landline international form.
+        r"(?<!\d)(?:\+?971|00971)[\s().-]*[234679](?:[\s().-]*\d){7}(?!\d)",
+        # UAE landline local form.
+        r"(?<!\d)0[234679](?:[\s().-]*\d){7}(?!\d)",
+    ]
+
+    found = []
+    seen = set()
+    for pattern in patterns:
+        for match in re.finditer(pattern, text):
+            p = normalize_phone(match.group(0))
+            if p and p not in seen:
+                seen.add(p)
+                found.append(p)
+    return found
+
+
+def extract_reference_phones(value):
+    """Extract every valid UAE phone from one Excel cell (cells may contain 2+ numbers)."""
+    if value is None:
+        return []
+    try:
+        if pd.isna(value):
+            return []
+    except Exception:
+        pass
+
+    text = str(value)
+    # First use the strict UAE extractor.
+    phones = extract_phone_candidates(text)
+    if phones:
+        return phones
+
+    # Fallback for clean single-value cells stored as numeric/string values.
+    p = normalize_phone(text)
+    return [p] if p else []
 
 
 def detect_phone_column(df):
@@ -67,38 +154,23 @@ def detect_phone_column(df):
         "wocompletedworkordersitephone",
         "phone", "mobile", "telephone", "tel", "contact number",
         "phone number", "mobile number", "site phone", "work order site phone",
-        "number",
     ]
     normalized = {str(c).strip().lower(): c for c in df.columns}
     for p in preferred:
         if p in normalized:
             return normalized[p]
 
-    best_col, best_score = None, 0
+    # Content-based fallback: choose the column with the highest share of UAE-phone cells.
+    best_col, best_score = None, 0.0
     for col in df.columns:
-        sample = df[col].dropna().astype(str).head(250)
+        sample = df[col].dropna().head(250)
         if len(sample) == 0:
             continue
-        valid = 0
-        for v in sample:
-            digits = re.sub(r"\D", "", v)
-            valid += 7 <= len(digits) <= 16
-        score = valid / max(len(sample), 1)
+        valid = sum(bool(extract_reference_phones(v)) for v in sample)
+        score = valid / len(sample)
         if score > best_score:
             best_col, best_score = col, score
     return best_col if best_score >= 0.35 else None
-
-
-def extract_phone_candidates(text):
-    raw = re.findall(r"(?:\+?\d[\d\s()./-]{5,}\d)", text or "")
-    seen, result = set(), []
-    for item in raw:
-        p = normalize_phone(item)
-        if 7 <= len(p) <= 16 and p not in seen:
-            seen.add(p)
-            result.append(p)
-    return result
-
 
 def extract_selectable_text_by_page(pdf_bytes, progress_callback=None):
     reader = PdfReader(io.BytesIO(pdf_bytes))
@@ -200,11 +272,15 @@ def smart_extract(pdf_bytes, progress_callback=None):
 
 
 def build_reference_index(df, phone_col):
+    """Index every phone in the selected Excel column, including multi-phone cells."""
     rows = []
+    seen = set()
     for idx, value in df[phone_col].items():
-        normalized = normalize_phone(value)
-        if normalized:
-            rows.append((idx, normalized, phone_variants(normalized)))
+        for normalized in extract_reference_phones(value):
+            key = (idx, normalized)
+            if key not in seen:
+                seen.add(key)
+                rows.append((idx, normalized, phone_variants(normalized)))
     return rows
 
 
@@ -213,27 +289,30 @@ def find_best_match(source_phone, reference_index):
     if not src:
         return None, "Not Matched", 0
 
-    src_vars = phone_variants(src)
+    # Canonical exact match is the safest rule and already handles 05... vs 9715....
     exact_matches = [(idx, ref) for idx, ref, _ in reference_index if ref == src]
     if exact_matches:
         return exact_matches[0][0], "High", 100
 
+    # Conservative fallback for OCR where only the leading UAE zero/country code differs.
+    src_vars = phone_variants(src)
     candidates = []
     for idx, ref, ref_vars in reference_index:
         common = src_vars.intersection(ref_vars)
-        common_lengths = [len(x) for x in common if len(x) >= 7]
-        if common_lengths:
-            strongest = max(common_lengths)
-            score = 95 if strongest >= 9 else (88 if strongest == 8 else 78)
-            candidates.append((score, idx, ref))
+        if common:
+            strongest = max(len(x) for x in common)
+            if strongest >= 9:
+                candidates.append((95, idx, ref))
+            elif strongest == 8:
+                candidates.append((88, idx, ref))
 
     if candidates:
         candidates.sort(reverse=True, key=lambda x: x[0])
         score, idx, _ = candidates[0]
-        confidence = "High" if score >= 90 else ("Medium" if score >= 80 else "Low")
+        confidence = "High" if score >= 90 else "Medium"
         return idx, confidence, score
-    return None, "Not Matched", 0
 
+    return None, "Not Matched", 0
 
 def create_output_excel(original_df, results_df, matched_reference_rows):
     output = io.BytesIO()
@@ -354,7 +433,7 @@ analysis_mode = st.radio(
     ],
     horizontal=False,
 )
-st.caption("No Claude, no API key and no paid AI service is used by this app. OCR runs with open-source Tesseract on the Streamlit server.")
+st.caption("No Claude, no API key and no paid AI service is used. Phone extraction is filtered to UAE phone formats to reduce OCR false positives.")
 
 run = st.button(
     "Run Monthly Analysis",
