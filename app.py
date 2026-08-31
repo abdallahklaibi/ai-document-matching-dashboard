@@ -64,9 +64,10 @@ def phone_variants(phone):
 
 def detect_phone_column(df):
     preferred = [
-        "phone", "mobile", "telephone", "tel", "contact", "contact number",
-        "phone number", "mobile number", "number", "evcontactprimarysale",
-        "evcontactsecsale",
+        "wocompletedworkordersitephone",
+        "phone", "mobile", "telephone", "tel", "contact number",
+        "phone number", "mobile number", "site phone", "work order site phone",
+        "number",
     ]
     normalized = {str(c).strip().lower(): c for c in df.columns}
     for p in preferred:
@@ -237,11 +238,12 @@ def find_best_match(source_phone, reference_index):
 def create_output_excel(original_df, results_df, matched_reference_rows):
     output = io.BytesIO()
     export_df = original_df.copy()
-    export_df["Match_Status"] = "Not Matched"
-    export_df["Match_Confidence"] = ""
-    export_df["Source_Phone"] = ""
-    export_df["Source_Page"] = ""
-    export_df["Read_Method"] = ""
+    # Use object dtype so pandas accepts both text and numeric page values safely.
+    export_df["Match_Status"] = pd.Series(["Not Matched"] * len(export_df), index=export_df.index, dtype="object")
+    export_df["Match_Confidence"] = pd.Series([""] * len(export_df), index=export_df.index, dtype="object")
+    export_df["Source_Phone"] = pd.Series([""] * len(export_df), index=export_df.index, dtype="object")
+    export_df["Source_Page"] = pd.Series([""] * len(export_df), index=export_df.index, dtype="object")
+    export_df["Read_Method"] = pd.Series([""] * len(export_df), index=export_df.index, dtype="object")
 
     for ref_idx, result_rows in matched_reference_rows.items():
         best = sorted(result_rows, key=lambda r: r["Match Score"], reverse=True)[0]
